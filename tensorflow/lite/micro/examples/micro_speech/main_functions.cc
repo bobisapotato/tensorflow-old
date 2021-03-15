@@ -21,12 +21,11 @@ limitations under the License.
 #include "tensorflow/lite/micro/examples/micro_speech/micro_features/micro_model_settings.h"
 #include "tensorflow/lite/micro/examples/micro_speech/micro_features/model.h"
 #include "tensorflow/lite/micro/examples/micro_speech/recognize_commands.h"
-#include "tensorflow/lite/micro/kernels/micro_ops.h"
 #include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/system_setup.h"
 #include "tensorflow/lite/schema/schema_generated.h"
-#include "tensorflow/lite/version.h"
 
 // Globals, used for compatibility with Arduino-style sketches.
 namespace {
@@ -49,6 +48,8 @@ int8_t* model_input_buffer = nullptr;
 
 // The name of this function is important for Arduino compatibility.
 void setup() {
+  tflite::InitializeTarget();
+
   // Set up logging. Google style is to avoid globals or statics because of
   // lifetime uncertainty, but since this has a trivial destructor it's okay.
   // NOLINTNEXTLINE(runtime-global-variables)
@@ -72,31 +73,19 @@ void setup() {
   // incur some penalty in code space for op implementations that are not
   // needed by this graph.
   //
-  // tflite::ops::micro::AllOpsResolver resolver;
+  // tflite::AllOpsResolver resolver;
   // NOLINTNEXTLINE(runtime-global-variables)
   static tflite::MicroMutableOpResolver<4> micro_op_resolver(error_reporter);
-  if (micro_op_resolver.AddBuiltin(
-          tflite::BuiltinOperator_DEPTHWISE_CONV_2D,
-          tflite::ops::micro::Register_DEPTHWISE_CONV_2D(),
-          tflite::MicroOpResolverAnyVersion()) != kTfLiteOk) {
+  if (micro_op_resolver.AddDepthwiseConv2D() != kTfLiteOk) {
     return;
   }
-  if (micro_op_resolver.AddBuiltin(
-          tflite::BuiltinOperator_FULLY_CONNECTED,
-          tflite::ops::micro::Register_FULLY_CONNECTED(),
-          tflite::MicroOpResolverAnyVersion()) != kTfLiteOk) {
+  if (micro_op_resolver.AddFullyConnected() != kTfLiteOk) {
     return;
   }
-  if (micro_op_resolver.AddBuiltin(tflite::BuiltinOperator_SOFTMAX,
-                                   tflite::ops::micro::Register_SOFTMAX(),
-                                   tflite::MicroOpResolverAnyVersion()) !=
-      kTfLiteOk) {
+  if (micro_op_resolver.AddSoftmax() != kTfLiteOk) {
     return;
   }
-  if (micro_op_resolver.AddBuiltin(tflite::BuiltinOperator_RESHAPE,
-                                   tflite::ops::micro::Register_RESHAPE(),
-                                   tflite::MicroOpResolverAnyVersion()) !=
-      kTfLiteOk) {
+  if (micro_op_resolver.AddReshape() != kTfLiteOk) {
     return;
   }
 

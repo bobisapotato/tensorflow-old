@@ -18,6 +18,7 @@ limitations under the License.
 #include <sys/types.h>
 
 #include <memory>
+#include <queue>
 #include <sstream>
 
 #include "absl/container/flat_hash_map.h"
@@ -98,23 +99,17 @@ uint32_t constexpr kOutfeedHeaderStart = 271828;
 // Special consumer IDs, without outfeed payload.
 uint32_t constexpr kOutfeedCidShutdown = 0;
 
-// A Device and its PjRtClient.
-struct DeviceWithClient {
-  Device* device;
-  std::shared_ptr<PjRtClient> client;
-};
-
 // Encapsulates data received from a device outfeed.
 class OutfeedData {
  public:
-  OutfeedData(DeviceWithClient device_client, uint32_t consumer_id, Shape shape)
-      : device_client_(device_client),
+  OutfeedData(PjRtDevice* device, uint32_t consumer_id, Shape shape)
+      : device_(device),
         consumer_id_(consumer_id),
         shape_(shape),
         literal_(nullptr),
         literal_size_bytes_(0) {}
 
-  DeviceWithClient device_client() { return device_client_; }
+  PjRtDevice* device() { return device_; }
   uint32_t consumer_id() const { return consumer_id_; }
   Shape shape() const { return shape_; }
   std::unique_ptr<Literal> literal() {
@@ -129,7 +124,7 @@ class OutfeedData {
   std::string DebugString() const;
 
  private:
-  DeviceWithClient device_client_;
+  PjRtDevice* device_;
   uint32_t consumer_id_;
   Shape shape_;
   std::unique_ptr<Literal> literal_;
@@ -150,15 +145,14 @@ void OutfeedData::SetLiteral(std::unique_ptr<Literal> literal) {
 }
 
 std::string OutfeedData::DebugString() const {
-  return absl::StrFormat("dev=%s; cons=%d; shape=%s",
-                         device_client_.device->DebugString(), consumer_id_,
-                         shape_.ToString());
+  return absl::StrFormat("dev=%s; cons=%d; shape=%s", device_->DebugString(),
+                         consumer_id_, shape_.ToString());
 }
 
 class OutfeedReceiverImpl {
  public:
   OutfeedReceiverImpl(OutfeedReceiver::Callback callback,
-                      std::vector<std::shared_ptr<PjRtClient>> clients,
+                      absl::Span<PjRtClient* const> clients,
                       ssize_t max_callback_queue_size_bytes);
 
   OutfeedReceiverImpl(const OutfeedReceiverImpl&) = delete;
@@ -194,7 +188,7 @@ class OutfeedReceiverImpl {
   Status SendShutdownOutfeedHeader(int device_idx);
 
   // Receives a raw Literal from a device outfeed.
-  StatusOr<std::unique_ptr<Literal>> ReceiveRawFromOutfeed(const Device* device,
+  StatusOr<std::unique_ptr<Literal>> ReceiveRawFromOutfeed(PjRtDevice* device,
                                                            const Shape& shape);
 
   // Enqueues received data in the callbaback queue.
@@ -206,8 +200,8 @@ class OutfeedReceiverImpl {
   void Shutdown();
 
   OutfeedReceiver::Callback callback_;
-  // The devices on which we are listening, with their clients.
-  std::vector<DeviceWithClient> devices_;
+  // The devices on which we are listening.
+  std::vector<PjRtDevice*> devices_;
   // Maximum bytes capacity of the callback queue.
   uint64_t max_callback_queue_size_bytes_;
 
@@ -232,14 +226,13 @@ class OutfeedReceiverImpl {
 };
 
 OutfeedReceiverImpl::OutfeedReceiverImpl(
-    OutfeedReceiver::Callback callback,
-    std::vector<std::shared_ptr<PjRtClient>> clients,
+    OutfeedReceiver::Callback callback, absl::Span<PjRtClient* const> clients,
     ssize_t max_callback_queue_size_bytes) {
   callback_ = callback;
   max_callback_queue_size_bytes_ = max_callback_queue_size_bytes;
   for (const auto& client : clients) {
-    for (const auto& device : client->devices()) {
-      devices_.push_back(DeviceWithClient{device.get(), client});
+    for (auto device : client->addressable_devices()) {
+      devices_.push_back(device);
     }
   }
   CHECK_GT(devices_.size(), 0);
@@ -291,11 +284,11 @@ void OutfeedReceiverImpl::DeviceListenerThreadLoop(int device_idx) {
     absl::MutexLock lock(&mu_);
     ++num_listening_threads_;
   }
-  DeviceWithClient device_client = devices_[device_idx];
+  PjRtDevice* device = devices_[device_idx];
   while (true) {
     Shape header_shape = ShapeUtil::MakeShape(U32, {kOutfeedHeaderWords});
     std::unique_ptr<Literal> header =
-        ReceiveRawFromOutfeed(device_client.device, header_shape).ValueOrDie();
+        ReceiveRawFromOutfeed(device, header_shape).ValueOrDie();
     absl::Span<uint32_t> header_data = header->data<uint32>();
     CHECK_EQ(header_data.size(), kOutfeedHeaderWords);
     CHECK_EQ(header_data[0], kOutfeedHeaderStart);
@@ -306,18 +299,17 @@ void OutfeedReceiverImpl::DeviceListenerThreadLoop(int device_idx) {
       auto registered_shape = shape_registry_.find(consumer_id);
       if (registered_shape == shape_registry_.end()) {
         LOG(FATAL)
-            << "[" << device_client.device->DebugString()
+            << "[" << device->DebugString()
             << "] Cannot find registered shape for consumer ID " << consumer_id
             << ". Perhaps the code was compiled with a different instance "
             << "of OutfeedReceiver.";
       }
       shape = registered_shape->second;
     }
-    auto received =
-        absl::make_unique<OutfeedData>(device_client, consumer_id, shape);
+    auto received = absl::make_unique<OutfeedData>(device, consumer_id, shape);
     VLOG(2) << "Listener received header " << received->DebugString();
     if (consumer_id == kOutfeedCidShutdown) {
-      VLOG(2) << "[" << device_client.device->DebugString()
+      VLOG(2) << "[" << device->DebugString()
               << "] Listener received shutdown header";
       absl::MutexLock lock(&mu_);
       --num_listening_threads_;
@@ -328,7 +320,7 @@ void OutfeedReceiverImpl::DeviceListenerThreadLoop(int device_idx) {
       return;
     }
     std::unique_ptr<Literal> data =
-        ReceiveRawFromOutfeed(device_client.device, shape).ValueOrDie();
+        ReceiveRawFromOutfeed(device, shape).ValueOrDie();
     received->SetLiteral(std::move(data));
     absl::MutexLock lock(&mu_);
     EnqueueReceivedData(std::move(received));
@@ -348,16 +340,10 @@ void OutfeedReceiverImpl::EnqueueReceivedData(
 }
 
 StatusOr<std::unique_ptr<Literal>> OutfeedReceiverImpl::ReceiveRawFromOutfeed(
-    const Device* device, const Shape& shape) {
-  std::shared_ptr<Literal> literal_shared;
-
-  TF_ASSIGN_OR_RETURN(LocalDeviceState * local_device,
-                      device->GetLocalDeviceState());
-  TF_ASSIGN_OR_RETURN(Literal literal,
-                      local_device->client()->TransferFromOutfeedLocal(
-                          shape, local_device->device_ordinal()));
-
-  return absl::make_unique<Literal>(std::move(literal));
+    PjRtDevice* device, const Shape& shape) {
+  auto literal = std::make_unique<Literal>(shape);
+  TF_RETURN_IF_ERROR(device->TransferFromOutfeed(literal.get()));
+  return literal;
 }
 
 void OutfeedReceiverImpl::CallbackThreadLoop() {
@@ -392,15 +378,14 @@ void OutfeedReceiverImpl::CallbackThreadLoop() {
     }
     {
       tensorflow::profiler::TraceMe traceme("OutfeedReceiver::Callback");
-      DeviceWithClient device_client = received->device_client();
-      callback_(device_client.device, std::move(device_client.client),
-                received->consumer_id(), received->literal());
+      callback_(received->device(), received->consumer_id(),
+                received->literal());
     }
   }
 }
 
 Status OutfeedReceiverImpl::SendShutdownOutfeedHeader(int device_idx) {
-  const Device* device = devices_[device_idx].device;
+  const PjRtDevice* device = devices_[device_idx];
   constexpr int consumer_id = kOutfeedCidShutdown;
   VLOG(2) << "[" << device->DebugString()
           << "] SendSpecialHeader cons=" << consumer_id;
@@ -419,13 +404,13 @@ Status OutfeedReceiverImpl::SendShutdownOutfeedHeader(int device_idx) {
   compile_options.executable_build_options.set_device_assignment(
       device_assignment);
 
-  TF_ASSIGN_OR_RETURN(
-      std::unique_ptr<PjRtExecutable> executable,
-      PjRtExecutable::Compile(computation, devices_[device_idx].client.get(),
-                              std::move(compile_options)));
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<PjRtExecutable> executable,
+                      devices_[device_idx]->client()->Compile(
+                          computation, std::move(compile_options)));
   ExecuteOptions execute_options;
-  TF_ASSIGN_OR_RETURN(std::vector<std::unique_ptr<PjRtBuffer>> output_buffers,
-                      executable->Execute({}, execute_options));
+  TF_ASSIGN_OR_RETURN(
+      std::vector<std::vector<std::unique_ptr<PjRtBuffer>>> output_buffers,
+      executable->Execute({{}}, execute_options));
   return Status::OK();
 }
 
@@ -468,11 +453,11 @@ StatusOr<XlaOp> OutfeedReceiverImpl::AddOutfeedToBuilder(
   return token;
 }
 
-OutfeedReceiver::OutfeedReceiver(
-    Callback callback, std::vector<std::shared_ptr<PjRtClient>> clients,
-    ssize_t max_callback_queue_size_bytes) {
+OutfeedReceiver::OutfeedReceiver(Callback callback,
+                                 absl::Span<PjRtClient* const> clients,
+                                 ssize_t max_callback_queue_size_bytes) {
   p_impl_ = absl::make_unique<OutfeedReceiverImpl>(
-      callback, std::move(clients), max_callback_queue_size_bytes);
+      callback, clients, max_callback_queue_size_bytes);
 }
 
 OutfeedReceiver::~OutfeedReceiver() {}

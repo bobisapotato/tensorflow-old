@@ -20,7 +20,6 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
-#include "absl/types/optional.h"
 #include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/nnapi/NeuralNetworksTypes.h"
 #include "tensorflow/lite/nnapi/nnapi_implementation.h"
@@ -80,7 +79,7 @@ class StatefulNnApiDelegate : public TfLiteDelegate {
     // above. The NNAPI CPU typically performs less well than built-in TfLite
     // kernels, but allowing CPU allows partial acceleration of models. If this
     // is set to true, NNAPI is only used if the whole model is accelerated.
-    bool disallow_nnapi_cpu = false;
+    bool disallow_nnapi_cpu = true;
 
     // Specifies the max number of partitions to delegate. A value <= 0 means
     // no limit.
@@ -117,21 +116,46 @@ class StatefulNnApiDelegate : public TfLiteDelegate {
     // within the specified duration, the execution will be aborted. If set to
     // 0, the default timeout for loops will be used.
     uint64_t max_execution_loop_timeout_duration_ns = 0;
+
+    // Whether to allow dynamic dimension sizes without re-compilation.
+    // A tensor of with dynamic dimension must have a valid dim_signature
+    // defined.
+    // Only supported in NNAPI 1.1 and newer versions.
+    // WARNING: Setting this flag to true may result in model being rejected by
+    // accelerator. This should only be enabled if the target device supports
+    // dynamic dimensions of the model.
+    bool allow_dynamic_dimensions = false;
   };
 
   // Uses default options.
   StatefulNnApiDelegate();
 
+  // The ownership of the NnApi instance is left to the caller of the
+  // StatefulNnApiDelegate constructor; the caller must ensure that the lifetime
+  // of the NnApi instance exceeds the lifetime of the StatefulNnApiDelegate.
   explicit StatefulNnApiDelegate(const NnApi* nnapi);
 
   // The constructor that accepts options from user.
+  // This makes a copy of any data that it needs from Options, so
+  // the caller can safely deallocate any storage pointed to by
+  // the 'const char *' members of Options immediately after calling this.
   explicit StatefulNnApiDelegate(Options options);
 
+  // Constructor that accepts both an NnApi instance and options.
+  // The ownership of the NnApi instance is left to the caller of the
+  // StatefulNnApiDelegate constructor; the caller must ensure that the lifetime
+  // of the NnApi instance exceeds the lifetime of the StatefulNnApiDelegate.
+  // This constructor makes a copy of any data that it needs from Options, so
+  // the caller can safely deallocate any storage pointed to by
+  // the 'const char *' members of Options immediately after calling this.
   StatefulNnApiDelegate(const NnApi* nnapi, Options options);
 
   ~StatefulNnApiDelegate() = default;
 
   // Returns the delegate options.
+  // The lifetime of the storage pointed to by the 'const char *' members of the
+  // returned Options object is the same as the lifetime of the supplied
+  // TfLiteDelegate instance.
   static const Options GetOptions(TfLiteDelegate* delegate);
 
   // Callback function which copies data from ANeuralNetworksMemory to host
@@ -225,6 +249,8 @@ class StatefulNnApiDelegate : public TfLiteDelegate {
     // Specifies the maximum expected duration in nanosecond for WHILE loops in
     // the execution
     uint64_t max_execution_loop_timeout_duration_ns = 0;
+    // Whether to allow dynamic dimension sizes without re-compilation.
+    bool allow_dynamic_dimensions = false;
 
     explicit Data(const NnApi* nnapi);
     ~Data();
@@ -234,7 +260,7 @@ class StatefulNnApiDelegate : public TfLiteDelegate {
                              NNAPIDelegateKernel* delegate_state);
     // Returns a cached NNAPIDelegateKernel if available and removes it
     // from the cache transferring the ownership to the caller.
-    absl::optional<NNAPIDelegateKernel*> GetCachedDelegateKernel(
+    NNAPIDelegateKernel* MaybeGetCachedDelegateKernel(
         const TfLiteDelegateParams* delegate_params);
   };
 

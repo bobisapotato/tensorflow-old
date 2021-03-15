@@ -21,6 +21,7 @@ from absl.testing import parameterized
 import numpy as np
 
 from tensorflow.python.data.experimental.ops import batching
+from tensorflow.python.data.kernel_tests import checkpoint_test_base
 from tensorflow.python.data.kernel_tests import test_base
 from tensorflow.python.data.ops import dataset_ops
 from tensorflow.python.framework import combinations
@@ -85,7 +86,7 @@ class DenseToSparseBatchTest(test_base.DatasetTestBase, parameterized.TestCase):
   @combinations.generate(test_base.default_test_combinations())
   def testDenseToSparseBatchDatasetWithInvalidShape(self):
     input_tensor = array_ops.constant([[1]])
-    with self.assertRaisesRegexp(ValueError, "Dimension -2 must be >= 0"):
+    with self.assertRaisesRegex(ValueError, "Dimension -2 must be >= 0"):
       dataset_ops.Dataset.from_tensors(input_tensor).apply(
           batching.dense_to_sparse_batch(4, [-2]))
 
@@ -98,15 +99,31 @@ class DenseToSparseBatchTest(test_base.DatasetTestBase, parameterized.TestCase):
 
     # Initialize with an input tensor of incompatible rank.
     get_next = self.getNext(dataset_fn([[1]]))
-    with self.assertRaisesRegexp(errors.InvalidArgumentError,
-                                 "incompatible with the row shape"):
+    with self.assertRaisesRegex(errors.InvalidArgumentError,
+                                "incompatible with the row shape"):
       self.evaluate(get_next())
 
     # Initialize with an input tensor that is larger than `row_shape`.
     get_next = self.getNext(dataset_fn(np.int32(range(13))))
-    with self.assertRaisesRegexp(errors.DataLossError,
-                                 "larger than the row shape"):
+    with self.assertRaisesRegex(errors.DataLossError,
+                                "larger than the row shape"):
       self.evaluate(get_next())
+
+
+class DenseToSparseBatchCheckpointTest(checkpoint_test_base.CheckpointTestBase,
+                                       parameterized.TestCase):
+
+  def _build_dataset(self, components):
+    return dataset_ops.Dataset.from_tensor_slices(components).map(
+        lambda x: array_ops.fill([x], x)).apply(
+            batching.dense_to_sparse_batch(4, [12]))
+
+  @combinations.generate(test_base.default_test_combinations())
+  def testCore(self):
+    components = np.random.randint(5, size=(40,)).astype(np.int32)
+
+    num_outputs = len(components) // 4
+    self.run_core_tests(lambda: self._build_dataset(components), num_outputs)
 
 
 if __name__ == "__main__":
